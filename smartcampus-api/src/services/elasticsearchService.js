@@ -1,5 +1,3 @@
-// src/services/elasticsearchService.js
-
 const { Client } = require('@elastic/elasticsearch');
 require('dotenv').config();
 
@@ -10,53 +8,93 @@ const client = new Client({
     password: process.env.ELASTICSEARCH_PASSWORD
   },
   tls: {
-    // Desabilite a verificação do certificado SSL para um ambiente de desenvolvimento
-    // Em produção, use um certificado válido ou configure corretamente.
     rejectUnauthorized: false
   }
 });
 
-// Função de busca
-async function searchTaxons(query) {
-  try {
-    const result = await client.search({
-      index: 'flora_funga_taxonomy', // O nome do seu índice
-      body: {
+/**
+ * Realiza uma busca textual e/ou por filtros no índice de táxons.
+ * @param {string} query 
+ * @param {object} filters
+ * @returns {Promise<Array<object>>}
+ */
+async function searchTaxons(query, filters = {}) {
+  const mustClauses = [];
+  const filterClauses = [];
+
+  if (query) {
+    mustClauses.push({
+      bool: {
+        should: [
+          { match: { scientificName: { query: query, boost: 5 } } },
+          { nested: { path: 'vernacularNames', query: { match: { 'vernacularNames.name': { query: query, boost: 3 } } } } },
+          { nested: { path: 'sinonyms', query: { match: { 'sinonyms.scientificName': { query: query, boost: 1 } } } } }
+        ]
+      }
+    });
+  }
+
+  if (filters.family) {
+    filterClauses.push({ match: { 'higherClassification.family': filters.family } });
+  }
+  if (filters.genus) {
+    filterClauses.push({ match: { 'higherClassification.genus': filters.genus } });
+  }
+  if (filters.locationID) {
+    filterClauses.push({
+      nested: {
+        path: 'distribution',
         query: {
-          multi_match: {
-            query: query,
-            fields: [
-              'scientificName^3', // Aumenta a relevância para nomes científicos
-              'vernacularNames.name^2', // Nomes populares
-              'acceptedNameUsage',
-              'higherClassification.*' // Busca em todos os campos da hierarquia
-            ]
-          }
+          match: { 'distribution.locationID': filters.locationID }
         }
       }
     });
+  }
+
+  try {
+    const result = await client.search({
+      index: 'flora_funga_taxonomy',
+      body: {
+        query: {
+          bool: {
+            must: mustClauses.length > 0 ? mustClauses : { match_all: {} },
+            filter: filterClauses
+          }
+        }
+      },
+      size: 1000 // <-- ADICIONADO: Aumenta o limite de resultados para 500
+    });
     return result.hits.hits.map(hit => hit._source);
   } catch (error) {
-    console.error("Erro na busca do Elasticsearch:", error);
+    console.error('[ES Service] Erro na busca do Elasticsearch:', error);
     throw error;
   }
 }
 
-// Função de buscar um táxon por ID
+/**
+ * Busca um único táxon pelo seu ID exato.
+ * @param {string} id 
+ * @returns {Promise<object|null>}
+ */
 async function getTaxonById(id) {
   try {
     const result = await client.get({
       index: 'flora_funga_taxonomy',
-      id: id
+      id: String(id)
     });
     return result._source;
   } catch (error) {
-    console.error("Erro ao buscar táxon por ID:", error);
-    return null;
+    if (error.meta && error.meta.statusCode === 404) {
+      return null;
+    }
+    console.error(`[ES Service] Erro ao buscar táxon por ID: ${id}:`, error.meta?.body?.error || error);
+    throw error;
   }
 }
 
 module.exports = {
+  client,
   searchTaxons,
   getTaxonById
 };
+
